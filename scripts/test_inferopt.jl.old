@@ -1,0 +1,164 @@
+using Flux, Statistics
+using Graphs, LinearAlgebra
+using SimpleWeightedGraphs
+using GraphNeuralNetworks
+using InferOpt
+
+using UMFSolver
+
+# load a dataset
+#dataset_path = "/data/aschulz/Documents2023/multiflow/dataset_N600_alldemands"
+#dataset = load_dataset_v2(dataset_path)
+
+# Goal: given an instance I=(G, K), learn a new cost function such that the instance solution
+# can be computed as a collection of shortest o_k-t_k-paths for all k in K
+
+# Graph cost encoder
+#cost_encoder = MEGNetConv(3 => 1)
+
+function original_graph(instance)
+    nk = nv(instance) - sum(instance.ndata.mask)
+    nnodes = nv(instance) - nk
+    s, t = edge_index(instance)
+    tg = SimpleWeightedDiGraph(s, t, instance.edata.e[1,:])
+    return induced_subgraph(tg, 1:nnodes)[1]
+end
+
+function arc_matrix(g)
+    #src, dst = edge_index(g)
+    src, dst = [e.src for e in edges(g)], [e.dst for e in edges(g)]
+
+    nnodes = size(src,1)
+    am  = zeros(Int64, nnodes, nnodes)
+    for a = 1:ne(g)
+        am[src[a], dst[a]] = a
+    end
+    return am
+end
+
+function getcol(g, path)
+    col::Vector{Int64} = []
+    am = arc_matrix(g)
+    for j = 1:(size(path, 1)-1)
+        push!(col, am[path[j], path[j+1]])
+    end
+    return col
+end
+
+function path_to_column(g, path)
+    p = getcol(g, path)
+    col = zeros(Float32, ne(g))
+    col[p] .= 1
+    return col
+end
+
+function edgeindex(g::SimpleWeightedDiGraph)
+    return [e.src for e in edges(g)], [e.dst for e in edges(g)]
+end
+
+function umf_maximizer(theta; instance)
+    # graph without the demand nodes
+    g = original_graph(instance)
+    # set the new weightsA
+    s,d = edgeindex(g)
+    #nw = theta
+    #if minimum(theta) < 0
+    #    nw = theta .- minimum(theta) .+ 0.1
+    #end
+    g = SimpleWeightedDiGraph(s, d, relu(theta))
+    # for each demand get shortest path
+    nn = sum(instance.ndata.mask)
+    nk = sum(map(!, instance.ndata.mask))
+    nedges = sum(instance.edata.mask)
+    cols = []
+    #return transpose(hcat([zeros(nedges) for _ in 1:nk]...))
+    for k in 1:nk
+        ok, tk = outneighbors(instance, nn+k)[1], inneighbors(instance, nn+k)[1]
+
+        if size(outneighbors(instance, nn+k),1)!=1 || size(inneighbors(instance, nn+k), 1)!=1
+            println("node ", nn+k, " is not a demand node")
+            return 
+        end
+        ds = dijkstra_shortest_paths(g, [ok], weights(g); dst=tk)
+        p = enumerate_paths(ds, tk)
+        if length(p)==0
+            ds = dijkstra_shortest_paths(g, tk)
+            p = enumerate_paths(ds, ok)
+            if length(p)==0
+                println("no route from ", ok, " to ", tk)
+                return
+            end
+        end
+        col = path_to_column(g, p)
+
+        push!(cols, col)
+    end
+    return hcat(cols...)
+end
+
+
+function umf_cost(ŷ; instance)
+    em = instance.edata.mask
+    r=Flux.Losses.crossentropy(vec(ŷ), vec(instance.y))
+    return r
+end
+
+
+perturbed_add = PerturbedAdditive(
+    umf_maximizer;
+    epsilon=.5, nb_samples=10
+)
+
+regret = Pushforward(
+    perturbed_add, umf_cost
+)
+
+include("model_inferopt.jl")
+
+dataset_path = "/data1/schulz/datasets/dataset_s2_prc_small_flexE_1_train"
+dataset = UMFSolver.load_dataset_v2(dataset_path)
+
+
+nnodes = sum(dataset[1].ndata.mask)
+ndemands = sum(map(!, dataset[1].ndata.mask))
+nedges = sum(dataset[1].edata.mask)
+println("Number of nodes: ", nnodes)
+println("Number of demands: ", ndemands)
+println("Number of edges: ", nedges)
+
+umf_encoder = ClassifierModel(16, 3, 1, nnodes)
+
+
+opt = Adam(1.0f-6)
+ps = Flux.params(umf_encoder)
+
+function pipeline_loss(x)
+    theta = umf_encoder(x)
+    return regret(theta; instance=x)
+end
+
+train_graphs, test_graphs = MLUtils.splitobs(dataset, at=0.9)
+
+
+train_loader = DataLoader(train_graphs,
+                    batchsize=1, shuffle=true, collate=true)
+test_loader = DataLoader(test_graphs,
+                    batchsize=1, shuffle=false, collate=true)
+
+
+for epoch in 1:1000
+    println("epoch: ", epoch)
+    for g in train_loader
+        #println("labels shape type, ", typeof(g.y), ", ", size(g.y))
+        grad = gradient(() -> pipeline_loss(g), ps)
+        Flux.Optimise.update!(opt, ps, grad)
+    end
+    val_losses = []
+    for g in test_loader
+        theta = umf_encoder(g)
+        ŷ = umf_maximizer(theta; instance=g)
+        push!(val_losses, Flux.Losses.crossentropy(vec(ŷ), vec(g.y)))
+    end
+    println("Validation loss : ", mean(val_losses))
+end
+ 

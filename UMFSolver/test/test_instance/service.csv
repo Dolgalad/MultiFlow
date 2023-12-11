@@ -1,0 +1,4 @@
+srcNodeId,dstNodeId,bandwidth,latency
+1,7,5.0,0.0
+2,6,5.0,0.0
+3,7,5.0,0.0

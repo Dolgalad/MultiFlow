@@ -1,0 +1,353 @@
+using Revise
+using LinearAlgebra
+using TensorBoardLogger
+using Logging
+using Flux
+using Flux: onecold, onehotbatch
+using Flux.Losses: logitbinarycrossentropy, binary_focal_loss, mean, logsoftmax
+using Flux: DataLoader
+using GraphNeuralNetworks
+using Statistics, Random
+using MLUtils
+using CUDA
+using Graphs
+using NNlib
+using BSON: @save
+
+using BlockDiagonals
+
+# arguments for the `train` function 
+Base.@kwdef mutable struct TrainingArgs
+
+    η = 1.0f-4            # learning rate
+    batchsize = 1      # batch size (number of graphs in each batch)
+    epochs = 1000         # number of epochs
+    seed = 17             # set seed > 0 for reproducibility
+    usecuda = true      # if true use cuda (if available)
+    nhidden = 128        # dimension of hidden features
+    infotime = 10      # report every `infotime` epochs
+    savetime = 10      # save the model every `savetime` epochs
+    es_patience = 100   # early stopping patience
+    modelname = ""
+    classifier_class = ArcDemandClassifierModel # type of classifier to use
+    nlayers = 1
+    dataset_path = "/data/aschulz/datasets_csv/dataset_subgraph_1_31_N100_k10"
+    save_path = "" # save file path
+end
+
+
+function get_labels(g)
+    #println("size ind : ", size(graph_indicator(g, edges=true)))
+    #println("edge targets size :", size(g.edata.targets))
+    #println(sum(graph_indicator(g, edges=true).==1))
+    #println(graph_indicator(g, edges=true).==1)
+
+    # get blocks
+    blocks = [g.edata.targets[:,(graph_indicator(g, edges=true).==i) .& map(!,g.edata.mask)] for i in 1:g.num_graphs]
+    #println("Block sizes : ", [size(b) for b in blocks])
+    b = Bool.(BlockDiagonal(blocks))
+    #println("Lables size : ", size(b))
+    return b
+end
+
+function eval_loss_accuracy(model, data_loader, device)
+    """Training loop evaluation function
+    """
+    loss = 0.0
+    acc,prec,rec = 0.0,0.0,0.0
+    # true positive, false positive, total positive rates
+    ntp, nfp, npos, nrpos = 0,0,0,0
+    ntot = 0
+    #for (g, y) in data_loader
+    for g in data_loader
+        #println("Type of g out of loader : ", typeof(g))
+        g = g |> device
+        ŷ = model(g) |> vec # |> device
+        #println("type and size of model prediction : ", typeof(ŷ), ", ", size(ŷ))
+        #println("type and size of g.edata.mask : ", typeof(g.edata.mask), ", ", size(g.edata.mask))
+        #println("type and size of g.edata.targets: ", typeof(g.edata.targets), ", ", size(g.edata.targets))
+        #println(g.edata.targets)
+
+        idx = findall(==(0), g.edata.mask)
+        yy = g.edata.targets[:, idx] |> vec
+        
+        n = length(yy)
+        #println("type and size of 'yy': : ", typeof(yy), ", ", size(yy))
+        loss += logitbinarycrossentropy(ŷ, yy) * n
+        #ow = 1. - (sum(y) / prod(size(y)))
+        ###println("one wiehgt ", ow)
+        #weights = y .* ow .+ ((1 .- y) .* (1 .- ow))
+        #loss += mean(-sum(weights .* y .* logsoftmax(ŷ))) * n
+
+
+        # accurate predictions
+        #println("N: ", n, ", ", size(yy))
+        pos_pred = ŷ .> 0
+        #println("Positive predictions: ", size(pos_pred), ", ", sum(pos_pred), ", ", typeof(pos_pred))
+        #println("yy type : ", typeof(yy))
+        prs = pos_pred .== yy
+        #println("Currect pred : ", typeof(prs), ", ", size(prs), ", ", sum(prs))
+        #println("N tp         : ", sum((pos_pred .& (yy .== 1))))
+        #println("N fp         : ", sum((pos_pred .& (yy .== 0))))
+        #println("N pos        : ", sum(pos_pred))
+
+        acc += sum(((ŷ .> 0) .== yy))
+        
+        ntp += sum((pos_pred .& (yy .== 1)))
+        nfp += sum((pos_pred .& (yy .== 0)))
+        npos += sum(pos_pred)
+        
+        nrpos += sum(yy .== 1)
+        ntot += n
+    end
+    # precision
+    f1 = 0.
+    rec = ntp / nrpos
+    if npos>0
+        prec = ntp / npos
+        f1 = 2. / ((1. / prec) + (1. / rec))
+    end
+    #println(ntp, ", ", nfp, ", ", npos, ", ", nrpos, ", ", ntot)
+    #println(ntp+nfp ," = ", npos, " => ")
+
+    #println("total predictions    : ", ntot)
+    #println("correct prediction    : ", acc)
+    #println("Number true positive : ", ntp)
+    #println("Number false positive: ", nfp)
+    #println("Number real positives: ", nrpos)
+    #println("Accuracy             : ", 100 * acc / ntot)
+    #println("Recall               : ", 100 * rec)
+    #println("Precision            : ", 100 * prec)
+    #println("F1                   : ", f1 * 100)
+
+    
+    return (loss = round(loss / ntot, digits = 4),
+            accuracy = round(acc * 100 / ntot, digits = 2),
+            precision = round(prec * 100, digits = 2),
+            recall = round(rec * 100, digits=2),
+            f1 = round(f1 * 100, digits=2)
+    )
+end
+
+function fill_param_dict!(dict, m, prefix)
+    """Fills a dictionary with model parameters, indexed by their names
+    """
+    if m isa Chain
+        for (i, layer) in enumerate(m.layers)
+            fill_param_dict!(dict, layer, prefix*"layer_"*string(i)*"/"*string(layer)*"/")
+        end
+    else
+        for fieldname in fieldnames(typeof(m))
+            val = getfield(m, fieldname)
+            if val isa AbstractArray
+                val = vec(val)
+            end
+            dict[prefix*string(fieldname)] = val
+        end
+    end
+end
+
+using Flux: trainable
+function parameter_names(model; prefix="")
+    #println("in parameter_names ", prefix)
+    names = []
+    if model isa AbstractArray{Float32}
+        if endswith(prefix, "/")
+	    #println("Prefix : ", prefix)
+            prefix = prefix[1:prevind(prefix, lastindex(prefix))]
+	    #println("Prefix 2: ", prefix)
+        end
+	#println("push ", prefix)
+	push!(names, prefix)
+    elseif model isa Chain
+        for (i,l) in enumerate(model.layers)
+            ns = parameter_names(l, prefix=prefix*string(i)*"/")
+	    #println("cat ", ns)
+            names = vcat(names, ns)
+        end
+    else
+        tp = trainable(model)
+        for (k,e) in zip(keys(tp), tp)
+            ns = parameter_names(e, prefix=prefix*string(k)*"/")
+	    #println("cat 2 ", ns)
+	    names = vcat(names, ns)
+        end
+    end
+    #println("out param anems)")
+    return names
+end
+
+function fill_parameter_dict!(dict, model, prefix="", grad=nothing)
+    if model isa AbstractArray{Float32}
+        if endswith(prefix, "/")
+            prefix = prefix[1:prevind(prefix, lastindex(prefix))]
+        end
+        dict[prefix] = model
+	if !isnothing(grad)
+            dict[prefix*"_grad"] = grad[prefix]
+	end
+    elseif model isa Chain
+        for (i,l) in enumerate(model.layers)
+            fill_parameter_dict!(dict, l, prefix*string(i)*"/", grad)
+        end
+    else
+        tp = trainable(model)
+        for (k,e) in zip(keys(tp), tp)
+            fill_parameter_dict!(dict, e, prefix*string(k)*"/", grad)
+        end
+    end
+end
+
+function train(; kws...)
+    """Training loop
+    """
+    args = TrainingArgs(; kws...)
+    args.seed > 0 && Random.seed!(args.seed)
+
+
+    if args.usecuda && CUDA.functional()
+        CUDA.allowscalar(true)
+        device = gpu
+        args.seed > 0 && CUDA.seed!(args.seed)
+        @info "Training on GPU"
+    else
+        device = cpu
+        @info "Training on CPU"
+    end
+
+    # LOAD DATA
+    NUM_TRAIN = 150
+
+    #dataset = getdataset()
+    dataset = UMFSolver.load_dataset(args.dataset_path)
+
+    #dataset = mcnf_dataset
+    train_data, test_data = splitobs(dataset, at = 0.1, shuffle = true)
+
+    train_loader = DataLoader(train_data; args.batchsize, shuffle = true, collate = true)
+    test_loader = DataLoader(test_data; args.batchsize, shuffle = false, collate = true)
+
+    # DEFINE MODEL
+    
+    nin = size(dataset[1].ndata.x, 1)
+    nnode = size(dataset[1].ndata.x, 2)
+    nhidden = args.nhidden
+    
+    model_name = args.modelname #"GNNNodeEmbedding"
+    if length(model_name)==0
+        model_name = "model_"*string(args.nlayers)*"layers_hidden"*string(nhidden)*"_lr"*string(args.η)*"_batch"*string(args.batchsize)
+    end
+    
+    save_path = args.save_path
+    if length(save_path)==0
+        save_path = model_name*".bson"
+    end
+
+    model = ArcDemandClassifierModel(nhidden, 3, nhidden, nhidden, args.nlayers, nnode) |> device
+
+
+    ps = Flux.params(model)
+    opt = AdamW(args.η)
+    
+    # LOGGING FUNCTION
+
+    function report(epoch, test)
+        #train = eval_loss_accuracy(model, train_loader, device)
+        #test = eval_loss_accuracy(model, test_loader, device)
+        #println("Epoch: $epoch   Train: $(train)   Test: $(test)")
+        println("Epoch: $epoch   Test: $(test)")
+
+    end
+    
+    # Tensorboard callback
+    # Create tensorboard logger
+    println("Dataset path : ", args.dataset_path," - ",  basename(args.dataset_path))
+    dataset_name = basename(args.dataset_path)*"_training"
+    logger = TBLogger(dataset_name*"/log_"*model_name, tb_overwrite)
+    best_f1 = 0.
+    
+    # Callback to log information after every epoch
+    function TBCallback(epoch)
+        #param_dict = Dict{String, Any}()
+        #fill_param_dict!(param_dict, model, "")
+        #train_m = eval_loss_accuracy(model, train_loader, device)
+        test_m = eval_loss_accuracy(model, test_loader, device)
+        with_logger(logger) do
+            #@info "model" params=param_dict log_step_increment=0
+            #@info "train" train_m... log_step_increment=0
+            @info "test" test_m...
+        end
+        #epoch % args.infotime == 0 && report(epoch, train_m, test_m)
+        epoch % args.infotime == 0 && report(epoch, test_m)
+
+        if epoch % args.savetime == 0 && test_m.f1>best_f1
+            @save save_path model
+            best_f1 = test_m.f1
+        end
+    end
+
+    # TRAIN
+    
+    function val_loss()
+        t = eval_loss_accuracy(model, test_loader, device)
+        println(t.loss)
+        return t.loss
+    end
+    es = Flux.early_stopping(val_loss, args.es_patience, min_dist=1.0f-8, init_score=1.0f8);
+
+    #train_m = eval_loss_accuracy(model, train_loader, device)
+    #test_m = eval_loss_accuracy(model, test_loader, device)
+    #report(0, test_m)
+
+    ######## Start training #########
+
+    println("Start training")
+    for epoch in 1:(args.epochs)
+        for g in train_loader
+	    # cast graph to device
+            t_graph_to_gpu::Float32 = @elapsed g::GNNGraph = g |> device
+	    println("\tGraph to device time : ", t_graph_to_gpu)
+
+	    # index of edge belonging to base graph
+            #t_get_idx::Float32 = @elapsed idx::CUDA.CuArray{Int64,1,CUDA.Mem.DeviceBuffer} = findall(==(0), g.edata.mask)
+            #t_get_idx::Float32 = @elapsed idx = findall(==(0), g.edata.mask)
+            t_get_idx::Float32 = @elapsed idx::CUDA.CuArray{Int64,1} = findall(==(0), g.edata.mask)
+
+	    println("Type idx: ", typeof(idx), ", ", size(idx))
+	    println("\tGet index time : ", t_get_idx)
+
+            
+	    # get observation of the data
+	    #t_get_label_obs::Float32 = @elapsed y = getobs(g.edata.targets, idx) |> vec  |> device
+	    #t_get_label_obs::Float32 = @elapsed y::CUDA.CuArray{Bool,1,CUDA.Mem.DeviceBuffer} = getobs(g.edata.targets, idx) |> vec  |> device
+	    t_get_label_obs::Float32 = @elapsed y = obsview(g.edata.targets, idx) |> vec  |> device
+
+
+	    println("\tGet label observation time  : ", t_get_label_obs, ", ", typeof(y), ", ", size(y))
+
+
+            gs = Flux.gradient(ps) do
+	        # prediction 
+                t_prediction::Float32 = @elapsed ŷ = model(g) |> vec
+		println("\tPrediction time type: ", t_prediction, ", ", typeof(ŷ), ", ", size(ŷ))
+                logitbinarycrossentropy(ŷ, y)
+
+                #ow = 1. - (sum(y) / prod(size(y)))
+                #println("one wiehgt ", ow, ", ", typeof(ow))
+                #weights = y .* ow .+ ((1 .- y) .* (1 .- ow))
+		#println("weights type size: ", typeof(weights), ", ", size(weights))
+                #mean(-sum(weights .* y .* logsoftmax(ŷ)))
+
+            end
+	    # optimization time
+	    t_opt_update::Float32 = @elapsed Flux.Optimise.update!(opt, ps, gs)
+	    println("\tOptimizer update time  : ", t_opt_update)
+    
+            
+            
+        end
+        TBCallback(epoch)
+        # save model
+        es() && break
+    end
+end

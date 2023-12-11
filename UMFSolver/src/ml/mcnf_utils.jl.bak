@@ -1,0 +1,108 @@
+#include("../datastructures/UMFData.jl")
+using Graphs
+using GraphNeuralNetworks
+
+
+
+"""
+    UMFData_to_SimpleDiGraph(inst::UMFData)
+
+Converts a UMFData object to a SimpleDiGraph
+"""
+function UMFData_to_SimpleDiGraph(inst::UMFData)
+    g = SimpleDiGraph(numnodes(inst))
+    for i in 1:size(inst.srcnodes,1)
+        add_edge!(g, inst.srcnodes[i], inst.dstnodes[i])
+    end
+    return g
+end
+
+"""
+    UMFData_to_DemandGraph(inst::UMFData)
+
+Converts a UMFData object to DemandGraph i.e. a SimpleDiGraph with a node added for every demand, an edge linking its source node to this demand node and an edge emanating from the demand node towards the destination of the demand.
+"""
+function UMFData_to_DemandGraph(inst::UMFData)
+    # create a SimpleDiGraph
+    g = UMFData_to_SimpleDiGraph(inst)
+    
+    # create the DemandGraph
+    n,m,k = numnodes(inst),numarcs(inst),numdemands(inst)
+    edge_features_size = (3, m + 2*k)
+    edge_features = zeros(Float32, edge_features_size)
+    node_features = zeros(Float32, (1, n+k))
+    demand_node_mask = ones(Bool, n+k)
+    demand_node_mask[1:n] .= 0
+    demand_edge_mask = ones(Bool, m+2*k)
+    demand_edge_mask[1:m] .= 0
+    
+    edge_features[1,1:m] = inst.costs
+    edge_features[2,1:m] = inst.capacities
+    
+    for i in 1:k
+        add_vertex!(g)
+        demand_node = n+i
+        add_edge!(g, demand_node, inst.srcdemands[i])
+        add_edge!(g, inst.dstdemands[i], demand_node)
+        edge_features[3,m+2*(i-1)+1] = inst.bandwidths[i]
+        edge_features[3,m+2*(i-1)+2] = -inst.bandwidths[i]
+    end
+    return g, node_features, demand_node_mask, edge_features, demand_edge_mask
+end
+
+
+
+"""
+    convert_to_GNNGraph(inst::UMFData)
+
+Convert a UMFData object to GraphNeuralNetworks.jl GNNGraph object.
+"""
+function UMFData_to_GNNGraph(inst::UMFData)
+    # start by creating a directed graph
+    dg, node_features, demand_node_mask, edge_features, demand_edge_mask = UMFData_to_DemandGraph(inst)
+    #println("Node features type: ", typeof(node_features), ", ", size(node_features))
+    #println("Demand node mask type: ", typeof(demand_node_mask), ", ", size(demand_node_mask))
+    #println("Edge features type: ", typeof(edge_features), ", ", size(edge_features))
+    #println("Demand edge maks type: ", typeof(demand_edge_mask), ", ", size(demand_edge_mask))
+    #println("Type of graph : ", typeof(dg))
+    #println("Type of nk: ", typeof(numdemands(inst)))
+
+
+    return GNNGraph(dg,
+               ndata=(x=node_features, mask=demand_node_mask),
+               edata=(e=edge_features, mask=demand_edge_mask),
+               gdata=(nk=numdemands(inst))
+           )
+end
+
+function UMFData_to_GNNGraph(inst::UMFData, labels::BitMatrix)
+    # start by creating a directed graph
+    dg, node_features, demand_node_mask, edge_features, demand_edge_mask = UMFData_to_DemandGraph(inst)
+    #println("labels size : ", size(labels))
+    #println("demand edge mask size : ", size(demand_edge_mask))
+    nkk = numdemands(inst)
+    demand_edge_labels = zeros(Float32, 2*nkk, nkk)
+    full_labels = vcat(labels, demand_edge_labels)
+
+    #println("Node features type: ", typeof(node_features), ", ", size(node_features))
+    #println("Demand node mask type: ", typeof(demand_node_mask), ", ", size(demand_node_mask))
+    #println("Edge features type: ", typeof(edge_features), ", ", size(edge_features))
+    #println("Demand edge maks type: ", typeof(demand_edge_mask), ", ", size(demand_edge_mask))
+    #println("Type of graph : ", typeof(dg))
+    #println("Type of nk: ", typeof(numdemands(inst)))
+
+    gnng = GNNGraph(dg,
+               ndata=(x=Float32.(node_features), mask=demand_node_mask),
+               edata=(e=Float32.(edge_features), mask=demand_edge_mask, targets=Bool.(transpose(full_labels))),
+               gdata=(nk=numdemands(inst))
+           )
+
+    #println("-->g  Node features type: ", typeof(gnng.ndata.x), ", ", size(gnng.ndata.x))
+    #println("-->g  Demand node mask type: ", typeof(gnng.ndata.mask), ", ", size(gnng.ndata.mask))
+    #println("-->g  Edge features type: ", typeof(gnng.edata.e), ", ", size(gnng.edata.e))
+    #println("-->g  Demand edge maks type: ", typeof(gnng.edata.mask), ", ", size(gnng.edata.mask))
+
+
+
+    return gnng
+end

@@ -1,0 +1,247 @@
+
+@testset "columngen" begin
+    # Write your tests here.
+    # toy instances
+    dat_0 = readinstance("../../instances/toytests/test0/")
+    dat_1 = readinstance("../../instances/toytests/test1/")
+    dat_2 = readinstance("../../instances/toytests/test2/")
+    dat_3 = readinstance("../../instances/toytests/test3/")
+
+    #colgensolve
+    prconfig = DefaultDijkstraPricingConfig()
+    msconfig = DefaultLinearMasterConfig()
+    config = ColGenConfigBase(msconfig, prconfig, "highs", "outputfileNULL")
+    mod_colgen_0 = solveCG(dat_0, config)
+    mod_colgen_1 = solveCG(dat_1, config)
+    if isinstalled("CPLEX")
+        config = ColGenConfigBase(msconfig, prconfig, "cplex", "outputfileNULL")
+    end
+    mod_colgen_2 = solveCG(dat_2, config)
+    mod_colgen_3 = solveCG(dat_3, config)
+
+    #some tests on the solutions.
+    #test on optimal values
+
+    value_0 = mod_colgen_0[2]
+    value_1 = mod_colgen_1[2]
+    value_2 = mod_colgen_2[2]
+    value_3 = mod_colgen_3[2]
+
+    @test value_0 ≈ 135
+    @test value_1 ≈ 145
+    @test value_2 ≈ 513
+    @test value_3 ≈ 605
+
+
+    #test on optimal vectors
+
+    vect_0 = mod_colgen_0[20]
+    vect_1 = mod_colgen_1[20]
+    vect_2 = mod_colgen_2[20]
+    vect_3 = mod_colgen_3[20]
+
+    @test vect_0[1][1] ≈ vect_0[1][7] ≈ vect_0[1][8] ≈ 1.0
+    @test vect_0[2][3] ≈ vect_0[2][7] ≈ 1.0
+    @test vect_0[3][3] ≈ vect_0[3][7] ≈ vect_0[3][8] ≈ vect_0[3][15] ≈ 1.0
+
+    #maybe vect_1 is not unique.
+
+    @test vect_2[1][1] ≈ vect_2[1][7] ≈ vect_2[1][8] ≈ 0.2
+    @test vect_2[1][9] ≈ vect_2[1][10] ≈ 0.8
+    @test vect_2[2][3] ≈ vect_2[2][7] ≈ 1.0
+    @test vect_2[3][3] ≈ vect_2[3][4] ≈ vect_2[3][15] ≈ 1.0
+
+    @test vect_3[1][9] ≈ vect_3[1][10] ≈ 1.0
+    @test vect_3[2][3] ≈ vect_3[2][7] ≈ 1.0
+    @test vect_3[3][3] ≈ vect_3[3][4] ≈ vect_3[3][15] ≈ 1.0
+
+    #test on number of iterations and columns generated
+    nit_0 = mod_colgen_0[4]
+    nit_1 = mod_colgen_1[4]
+    nit_2 = mod_colgen_2[4]
+    nit_3 = mod_colgen_3[4]
+
+    ncol_0 = mod_colgen_0[5]
+    ncol_1 = mod_colgen_1[5]
+    ncol_2 = mod_colgen_2[5]
+    ncol_3 = mod_colgen_3[5]
+
+    @test nit_0 == 1 + 1
+    @test nit_1 == 3 + 1
+    @test nit_2 == 3 + 1
+    @test nit_3 == 3 + 1
+
+    @test ncol_0 == 0 + numdemands(dat_0)
+    @test ncol_1 == 6 + numdemands(dat_1)
+    @test ncol_2 == 6 + numdemands(dat_2)
+    @test ncol_3 == 6 + numdemands(dat_3)
+
+    #some tests on first column generation iterations:
+    #test that all columns are as expected.
+
+    ms0 = mod_colgen_0[21]
+    ms1 = mod_colgen_1[21]
+    ms2 = mod_colgen_2[21]
+    ms3 = mod_colgen_3[21]
+
+    @test UMFSolver.column_x_k_p(ms0, 1, 1) == [1, 7, 8]
+    @test UMFSolver.column_x_k_p(ms0, 2, 1) == [3, 7]
+    @test UMFSolver.column_x_k_p(ms0, 3, 1) == [15, 3, 7, 8]
+
+    @test UMFSolver.column_x_k_p(ms2, 1, 1) == [1, 7, 8]
+    @test UMFSolver.column_x_k_p(ms2, 1, 2) == [1, 4]
+    @test UMFSolver.column_x_k_p(ms2, 1, 3) == [9, 10]
+    @test UMFSolver.column_x_k_p(ms2, 2, 1) == [3, 7]
+    @test UMFSolver.column_x_k_p(ms2, 2, 2) == [3, 4, 18]
+    @test UMFSolver.column_x_k_p(ms2, 2, 3) == [12, 9, 10, 18]
+    @test UMFSolver.column_x_k_p(ms2, 3, 1) == [15, 3, 7, 8]
+    @test UMFSolver.column_x_k_p(ms2, 3, 2) == [15, 3, 4]
+    @test UMFSolver.column_x_k_p(ms2, 3, 3) == [15, 12, 9, 10]
+
+
+
+    # small instances
+    dat_sm1 = readinstance("../../instances/prc/small/mixed/1/")
+    dat_sm2 = readinstance("../../instances/prc/small/mixed/2/")
+
+    #colgensolve
+    prconfig = DefaultDijkstraPricingConfig()
+    msconfig = DefaultLinearMasterConfig()
+    if isinstalled("CPLEX")
+        config = ColGenConfigBase(msconfig, prconfig, "cplex", "outputfileNULL")
+    else
+        config = ColGenConfigBase(msconfig, prconfig, "highs", "outputfileNULL")
+    end
+    mod_colgen_sm1 = solveCG(dat_sm1, config)
+    mod_colgen_sm2 = solveCG(dat_sm2, config)
+
+    #some tests:
+    #objective values
+    value_sm1 = mod_colgen_sm1[2]
+    value_sm2 = mod_colgen_sm2[2]
+
+    @test value_sm1 ≈ 150369.34881516828
+    @test value_sm2 ≈ 160264.5359289629
+
+    #optimal solutions
+
+    vect_sm1 = mod_colgen_sm1[20]
+    vect_sm2 = mod_colgen_sm2[20]
+
+    @test vect_sm1[1][4] ≈
+          vect_sm1[1][441] ≈
+          vect_sm1[1][649] ≈
+          vect_sm1[1][655] ≈
+          vect_sm1[1][689] ≈
+          1.0
+    @test vect_sm1[2][5] ≈
+          vect_sm1[2][250] ≈
+          vect_sm1[2][649] ≈
+          vect_sm1[2][655] ≈
+          vect_sm1[2][689] ≈
+          1.0
+    @test vect_sm1[3][2] ≈
+          vect_sm1[3][644] ≈
+          vect_sm1[3][649] ≈
+          vect_sm1[3][655] ≈
+          vect_sm1[3][689] ≈
+          1.0
+    @test vect_sm1[4][7] ≈
+          vect_sm1[4][478] ≈
+          vect_sm1[4][650] ≈
+          vect_sm1[4][667] ≈
+          vect_sm1[4][683] ≈
+          1.0
+    @test vect_sm1[5][7] ≈
+          vect_sm1[5][478] ≈
+          vect_sm1[5][650] ≈
+          vect_sm1[5][667] ≈
+          vect_sm1[5][683] ≈
+          1.0
+    @test vect_sm1[6][8] ≈ vect_sm1[6][709] ≈ vect_sm1[6][1166] ≈ 1.0
+
+
+    @test vect_sm2[1][4] ≈
+          vect_sm2[1][337] ≈
+          vect_sm2[1][691] ≈
+          vect_sm2[1][698] ≈
+          vect_sm2[1][729] ≈
+          1.0
+    @test vect_sm2[2][5] ≈
+          vect_sm2[2][611] ≈
+          vect_sm2[2][692] ≈
+          vect_sm2[2][712] ≈
+          vect_sm2[2][729] ≈
+          1.0
+    @test vect_sm2[3][1] ≈
+          vect_sm2[3][551] ≈
+          vect_sm2[3][692] ≈
+          vect_sm2[3][712] ≈
+          vect_sm2[3][729] ≈
+          1.0
+
+
+    #number of iterations and columns generated
+
+    nit_sm1 = mod_colgen_sm1[4]
+    nit_sm2 = mod_colgen_sm2[4]
+
+    ncol_sm1 = mod_colgen_sm1[5]
+    ncol_sm2 = mod_colgen_sm2[5]
+
+    @test nit_sm1 == 1 + 1
+    @test nit_sm2 == 2 + 1
+
+    @test ncol_sm1 == 0 + numdemands(dat_sm1)
+    @test ncol_sm2 == 35 + numdemands(dat_sm2)
+
+
+    #test that all columns are as expected.
+    ms_sm2 = mod_colgen_sm2[21]
+
+    pr_sm1 = mod_colgen_sm1[22]
+    pr_sm2 = mod_colgen_sm2[22]
+
+    @test UMFSolver.column_x_k_p(ms_sm2, 4, 1) == [7, 290, 691, 698, 729]
+    @test UMFSolver.column_x_k_p(ms_sm2, 4, 2) == [8, 689, 691, 698, 729]
+    @test UMFSolver.column_x_k_p(ms_sm2, 5, 1) == [10, 290, 691, 698, 729]
+    @test UMFSolver.column_x_k_p(ms_sm2, 5, 2) == [9, 677, 692, 712, 729]
+    @test UMFSolver.column_x_k_p(ms_sm2, 6, 1) == [7, 290, 691, 698, 729]
+    @test UMFSolver.column_x_k_p(ms_sm2, 6, 2) == [8, 689, 691, 698, 729]
+
+
+    # test on rescaled:
+
+    path = "../../instances/toytests/test1/"
+    type = "CG"
+    optimizer = isinstalled("CPLEX") ? "cplex" : "highs"
+    outfile = "../../output/test_toy1_f0.5.txt"
+    factor = 0.5
+
+    sol = solveUMFrescaled(path, type, optimizer, outfile, factor)
+    @test sol ≈ 1239.0
+
+    dat_1_bis = readinstance(path, factor)
+    mod_colgen_1_bis = solveCG(dat_1_bis, config)
+    # optimal vector
+    vect_1_bis = mod_colgen_1_bis[20]
+    #master problem
+    ms1_bis = mod_colgen_1_bis[21]
+    @test vect_1_bis == UMFSolver.xopt(ms1_bis)
+
+    @test vect_1_bis[1][9] ≈ vect_1_bis[1][10] ≈ 1.0
+    @test vect_1_bis[2][3] ≈ vect_1_bis[2][7] ≈ 1.0
+    @test vect_1_bis[3][3] ≈ vect_1_bis[3][15] ≈ 0.2
+    @test vect_1_bis[3][4] ≈ 0.5
+    @test vect_1_bis[3][6] ≈ 0.3
+
+    x_k_p = UMFSolver.getx(ms1_bis)
+    y_k = UMFSolver.gety(ms1_bis)
+
+    @test x_k_p[1] ≈ [0.0, 0.0, 1.0]
+    @test x_k_p[2] ≈ [1.0, 0.0, 0.0]
+    @test x_k_p[3] ≈ [0.0, 0.2, 0.0, 0.3]
+    @test y_k ≈ [0.0, 0.0, 0.5]
+
+
+end

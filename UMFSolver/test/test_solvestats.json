@@ -1,0 +1,23 @@
+{
+    "nits": 2,
+    "primal": 135.0,
+    "last_time_ms_addcol": 0.0,
+    "t_create_pricing": 2.7786e-5,
+    "last_nits": 0,
+    "t_init_master": 0.000184297,
+    "last_timetot": 0.0,
+    "time_ms_sol": 0.00075096,
+    "last_ncols": 0,
+    "ncols": 3,
+    "accepteddemands": 1,
+    "last_time_ms_sol": 0.0,
+    "timetot": 0.000931148,
+    "val": 135.0,
+    "t_create_master": 0.000151052,
+    "last_val": 0.0,
+    "nit_avg": 0,
+    "last_primal": 0.0,
+    "last_time_pr_sol": 0.0,
+    "time_ms_addcol": 8.2171e-5,
+    "time_pr_sol": 9.4895e-5
+}

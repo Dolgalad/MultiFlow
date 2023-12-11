@@ -1,0 +1,256 @@
+ENV["JULIA_CUDA_MEMORY_POOL"] = "none"
+
+println("TESTING Model3")
+
+using Plots
+using GraphNeuralNetworks, Graphs, Flux, CUDA, Statistics, MLUtils
+using Flux: DataLoader
+using Flux.Losses: logitbinarycrossentropy, binary_focal_loss, mean, logsoftmax
+
+using UMFSolver
+using Distributions
+using TensorBoardLogger
+using Logging
+using LinearAlgebra
+
+using BSON: @save
+
+device = CUDA.functional() ? Flux.gpu : Flux.cpu;
+
+println("CUDA.functional: ", CUDA.functional())
+
+workdir = "/data1/schulz"
+mkpath(workdir)
+
+
+accuracy(y_pred, y_true)     = sum(y_pred .== y_true)/size(y_pred, 1)
+tpcount(y_pred, y_true)      = sum( Bool.(y_pred .== y_true) .& Bool.(y_true)  )
+precision(y_pred, y_true)    = sum(y_pred)>0 ? tpcount(y_pred, y_true)/sum(y_pred) : 0
+recall(y_pred, y_true)       = sum(y_true)>0 ? tpcount(y_pred, y_true)/sum(y_true) : 0
+f_beta_score(y_pred, y_true, beta=1.) = precision(y_pred,y_true)>0. && recall(y_pred,y_true)>0. ? sum(1 .+ (beta^2)) * (precision(y_pred,y_true)*recall(y_pred,y_true))/(((beta^2) * precision(y_pred,y_true)) + recall(y_pred,y_true)) : 0
+graph_reduction(y_pred)      = 1. - sum(y_pred)/prod(size(y_pred))
+
+
+function train_model(epochs, nhidden, 
+		      nlayers, 
+		      device, 
+		      lr, 
+		      dataset_path, 
+		      model_name, 
+		      tb_log_dir,
+		      eval_dataset,
+		      es_patience,
+		      weight
+		      )
+    dataset_name = basename(dataset_path)
+    eval_dataset_name = basename(eval_dataset)
+
+    println("\tnhidden            = ", nhidden)
+    println("\tnlayers            = ", nlayers)
+    println("\tdevice             = ", device)
+    println("\tlr                 = ", lr)
+    println("\tdataset            = ", dataset_path)
+    println("\tdataset name       = ", dataset_name)
+    println("\tmodel name         = ", model_name)
+    println("\tlog dir            = ", tb_log_dir)
+    println("\tevaluation dataset = ", eval_dataset)
+    println("\tevaluation dataset name = ", eval_dataset_name)
+    println("\tES patience        = ", es_patience)
+    println("\tweight             = ", weight)
+    save_path = joinpath(workdir, "models", dataset_name, model_name)
+    mkpath(save_path)
+    println("\tmodel save path    = ", save_path)
+
+
+    best_f1 = -1.0f8
+    
+    all_graphs = GNNGraph[]
+    all_graphs = UMFSolver.load_dataset(dataset_path)
+
+
+    # count number of nodes in the graph
+    nnodes = sum(all_graphs[1].ndata.mask)
+    println("\tnnodes             = ", nnodes)
+
+    model = UMFSolver.M3ClassifierModel(nhidden, 3, nlayers, nnodes) |> device
+    
+    ps = Flux.params(model)
+    
+    opt = Flux.Optimise.Optimiser(ClipNorm(1.0), Adam(lr))
+    opt = Adam(lr)
+
+    
+    train_graphs, test_graphs = MLUtils.splitobs(all_graphs, at=0.9)
+    
+    train_loader = DataLoader(train_graphs,
+                    batchsize=1, shuffle=true, collate=true)
+    test_loader = DataLoader(test_graphs,
+                   batchsize=1, shuffle=false, collate=true)
+    
+    
+    function metrics(loader)
+        preds = [(Int64.(cpu((vec(model(g |> device)) .> 0))),Int64.(vec(g.targets))) for g in loader]
+        acc = mean([accuracy(pred, lab) for (pred,lab) in preds])
+        rec = mean([recall(pred, lab) for (pred,lab) in preds])
+        prec = mean([precision(pred, lab) for (pred,lab) in preds])
+        f1 = mean([f_beta_score(pred, lab) for (pred,lab) in preds])
+        gr = mean([graph_reduction(pred) for (pred,lab) in preds])
+    
+        return (acc=acc, rec=rec, prec=prec, f1=f1, gr=gr)
+    end
+    
+    
+    logger = TBLogger(tb_log_dir, tb_overwrite)
+    
+    function TBCallback(epoch)
+        train_loss = loss(train_loader)
+        test_loss = loss(test_loader)
+        train_metrics = metrics(train_loader)
+        test_metrics = metrics(test_loader)
+
+        # image on test graph 1
+	g = test_graphs[1]
+        node_codes,_ = UMFSolver.m3_compute_graph_embeddings(model, g |> device)
+        nedm = UMFSolver.node_distance_matrix(Flux.cpu(node_codes))
+        adj_mat = (adjacency_matrix(g, dir=:in) .+ adjacency_matrix(g, dir=:out)) .> 0
+        plt=plot(heatmap(nedm, title="Node embedding distances"), size=(500,500));
+	demask = .!g.ndata.mask
+	dd_plt=plot(heatmap(nedm[demask,demask]), size=(500,500));
+
+
+
+        #println("train_loss: ", typeof(train_loss))
+        #println("test loss : ", typeof(test_loss))
+        #println("train_metrics: ", typeof(train_metrics))
+        #println("test metrics : ", typeof(test_metrics))
+
+        with_logger(logger) do
+            @info "train" loss=train_loss train_metrics...
+            @info "test" loss=test_loss test_metrics...
+            @info "test_img" adj=plt dn_dist=dd_plt
+        end
+    
+    end
+    
+    
+    #loss(g::GNNGraph) = logitbinarycrossentropy(vec(model(g)), vec(g.y))
+    loss(g::GNNGraph) = Flux.Losses.tversky_loss(sigmoid(vec(model(g))), vec(g.targets); beta=0.7)
+    loss(loader) = mean(loss(g |> device) for g in loader)
+    
+    # Early stopping
+    function es_metric()
+        return loss(test_loader)
+        return -metrics(test_loader).f1
+    end
+    es = Flux.early_stopping(es_metric, es_patience, min_dist=1.0f-8, init_score=1.0f8);
+    
+    
+    println("starting training")
+    for epoch in 1:epochs
+        for g in train_loader
+            g = g |> device
+            grad = gradient(() -> loss(g), ps)
+            #println("GRAD : ", grad)
+            #if any([sum(isnan.(grad[p] |> cpu)) > 0 for p in Flux.params(model)])
+            #    println([isnan.(grad[p] |> cpu) for p in Flux.params(model)])
+            #    throw("NaN found")
+            #end
+            Flux.Optimise.update!(opt, ps, grad)
+	    ###GC.gc() ; CUDA.reclaim()
+        end
+
+        test_metrics = metrics(test_loader)
+        @info (; epoch, train_loss=loss(train_loader), test_loss=loss(test_loader), test_metrics=test_metrics)
+        TBCallback(epoch)
+        # checkpoints
+        _model = model |> Flux.cpu
+    	@save joinpath(save_path, "checkpoint_e$(epoch).bson") _model
+        # early stopping
+        es() && break
+    end
+    
+    # testing: load the testing dataset
+    function solve_dataset(dataset_dir::String, output_dir::String, pr::String)
+        for f in readdir(dataset_dir, join=true)
+            link_f = joinpath(f, "link.csv")
+            if !isfile(link_f)
+                continue
+            end
+            sol, stats = solveUMF(f*"/", "CG", "highs", "./output.txt", "", pr)
+            stats_path = joinpath(output_dir, basename(f))
+            
+            UMFSolver.save(stats, stats_path)
+            #inst = UMFData(f)
+        end
+    end
+end 
+
+
+
+epochs_ = [100]
+nhiddens = [64]
+nlayers_ = [4]
+devices = [device]
+lrs = [1.0e-6]
+train_datasets = ["/data1/schulz/datasets/dataset_prc_small_flexE_1_train"]
+eval_datasets = ["/data1/schulz/datasets/dataset_prc_small_flexE_1_test"]
+# DEBUG
+#train_datasets = ["datasets/dataset_prc_small_flexE_1_train"]
+#eval_datasets = ["datasets/dataset_prc_small_flexE_1_test"]
+
+weights = [.95]
+es_patiences = [10]
+
+# call train_model on a dummy case first to force compilation
+train_model(1, 2, 1, device, 0.0001, eval_datasets[1], "dummy2_model8", "dummy2_model_log8", eval_datasets[1], 1, .5)
+
+
+dataset_names = ["dataset_prc_small_flexE_1",
+	         #"dataset_prc_small_flexE_2",
+                 #"dataset_prc_small_flexE_3",
+                 #"dataset_prc_small_flexE_4",
+                 #"dataset_prc_small_flexE_5",
+                 #"dataset_prc_small_mixed_1",
+	         #"dataset_prc_small_mixed_2",
+                 #"dataset_prc_small_mixed_3",
+                 #"dataset_prc_small_mixed_4",
+                 #"dataset_prc_small_mixed_5",
+                 #"dataset_prc_small_vlan_1",
+	         #"dataset_prc_small_vlan_2",
+                 #"dataset_prc_small_vlan_3",
+                 #"dataset_prc_small_vlan_4",
+                 #"dataset_prc_small_vlan_5",
+                 #"dataset_prc_middle_flexE_1",
+	         #"dataset_prc_middle_flexE_2",
+                 #"dataset_prc_middle_flexE_3",
+                 #"dataset_prc_middle_flexE_4",
+                 #"dataset_prc_middle_flexE_5",
+	    ]
+
+for name in dataset_names
+    train_dataset_path = joinpath(workdir, "datasets", name*"_train")
+    test_dataset_path = joinpath(workdir, "datasets", name*"_test")
+    # DEBUG
+    #train_dataset_path = joinpath(dirname(workdir), "datasets", name*"_train")
+    #test_dataset_path = joinpath(dirname(workdir), "datasets", name*"_test")
+
+    if !isdir(train_dataset_path) || !isdir(test_dataset_path)
+        println("skipping ", name)
+        continue
+    end
+    model_name = "model3_l"*string(nlayers_[1])*"_lr"*string(lrs[1])*"_h"*string(nhiddens[1])*"_tversky.7_v2"
+    # DEBUG
+    #model_name = "model3_l"*string(nlayers_[1])*"_lr"*string(lrs[1])*"_h"*string(nhiddens[1])*"_tversky.7_emb0"
+
+    tb_log_dir = joinpath(workdir, "tb_logs", "model3_$(name)_logs", model_name)
+
+    train_model(epochs_[1], nhiddens[1], nlayers_[1], device, lrs[1], train_dataset_path, model_name, tb_log_dir, test_dataset_path, 10, .5)
+
+    # reclaim memory
+    println("Reclaiming memory")
+    @sync GC.gc()
+    CUDA.reclaim()
+    println("done")
+
+end
+

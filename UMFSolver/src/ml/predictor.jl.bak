@@ -1,0 +1,46 @@
+#include("../datastructures/UMFData.jl")
+include("mcnf_utils.jl")
+include("model.jl")
+
+#struct ArcDemandClassifierModel
+#    model
+#end
+
+"""
+    ArcDemandClassifier
+
+Abstract data structure representing a classifier accepting as its input a UMFData object and returning a Boolean table with shape (number_of_arcs, number_of_demands). 
+
+It has two constructors:
+
+    UMFData(
+        model::ArcDemandClassifierModel,
+    )
+
+    Default constructor.
+
+    # Arguments
+
+    - `model`: trained model
+"""
+struct ArcDemandClassifier
+    model::ArcDemandClassifierModel
+    #default constructor
+    function UMFData(model::ArcDemandClassifierModel)
+        new(model)
+    end
+end
+
+
+"""
+    predict(inst::UMFData, cls::ArcDemandClassifier)
+
+Apply classifier to an instance.
+
+"""
+function predict(inst::UMFData, cls::ArcDemandClassifier)
+    # convert UMFData object to GNNGraph object to apply model
+    gnn_inst = convert_to_GNNGraph(inst)
+    # predict
+    return (cls.model(gnn_inst) > 0.)
+end

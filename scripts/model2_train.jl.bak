@@ -1,0 +1,381 @@
+using GraphNeuralNetworks, Graphs, Flux, CUDA, Statistics, MLUtils
+using Flux: DataLoader
+using Flux.Losses: logitbinarycrossentropy, binary_focal_loss, mean, logsoftmax
+
+using UMFSolver
+using Distributions
+using TensorBoardLogger
+using Logging
+using LinearAlgebra
+#using JLD2
+
+using BSON: @save
+
+device = CUDA.functional() ? Flux.gpu : Flux.cpu;
+
+println("CUDA.functional: ", CUDA.functional())
+
+# graph opposite layer
+struct EdgeReverseLayer <: GraphNeuralNetworks.GNNLayer
+end
+
+function (l::EdgeReverseLayer)(g::GNNGraph)
+    return g
+    s, t = edge_index(g)
+    return GNNGraph(t, s, ndata=(;x=g.ndata.x), edata=(;e=g.edata.e))
+
+    return GNNGraph(t, s, ndata=getobs(g.ndata), edata=getobs(g.edata))
+    return GNNGraph(transpose(adjacency_matrix(g)), ndata=(;x=obsview(g.x)), edata=(;e=obsview(g.e)))
+end
+
+# message passing layer
+struct MPLayer
+    forward_conv
+    #drop1
+    bn_n
+    bn_e
+    rev
+    backward_conv
+    #drop2
+end
+
+Flux.@functor MPLayer
+
+
+function MPLayer(n::Int)
+    return MPLayer(MEGNetConv(n=>n), Flux.BatchNorm(n), Flux.BatchNorm(n), EdgeReverseLayer(), MEGNetConv(n=>n))
+end
+
+function (l::MPLayer)(g, x, e)
+    x,e = l.forward_conv(g, x, e)
+    #x = l.drop1(x)
+    x = l.bn_n(x)
+    e = l.bn_e(e)
+    ng = l.rev(g)
+    x,e = l.backward_conv(ng, x, e)
+    return x, e
+end
+
+# classifier
+struct ClassifierModel
+    node_embeddings
+    edge_encoder
+    graph_conv
+    scoring
+end
+
+Flux.@functor ClassifierModel
+
+function concat_nodes(xi, xj, e::Nothing)
+    return vcat(xi, xj)
+end
+
+function ClassifierModel(node_feature_dim::Int, edge_feature_dim::Int, n_layers::Int, nnodes::Int)
+    node_embeddings = Flux.Embedding(nnodes, node_feature_dim)# |> device
+    edge_encoder    = Chain(
+			    Flux.Dense(edge_feature_dim => node_feature_dim, elu),
+			    Flux.Dropout(.1),
+			    Flux.BatchNorm(node_feature_dim),
+			    Flux.Dense(node_feature_dim=>node_feature_dim, elu),
+			    Flux.Dropout(.1)
+			    )
+    edge_encoder = Dense(edge_feature_dim => node_feature_dim, elu)
+    #graph_conv      = [MEGNetConv(node_feature_dim => node_feature_dim) for _ in 1:n_layers]
+    graph_conv      = [MPLayer(node_feature_dim) for _ in 1:n_layers]
+
+    scoring = Flux.Bilinear((2*node_feature_dim, node_feature_dim) => 1, elu)# |> device
+
+    ClassifierModel(node_embeddings, edge_encoder, graph_conv, scoring)# |> device
+end
+
+function (model::ClassifierModel)(g::GNNGraph)
+    # number of real edges
+    nedges = sum(g.edata.mask)
+    # stack the node embeddings and demand embeddings
+    nnodes = sum(g.ndata.mask)
+    ndemands = g.num_nodes - nnodes
+
+
+    # first encode the edge features
+    edge_features = model.edge_encoder(g.e)
+    #println("edge_features : ", [typeof(edge_features), size(edge_features)])
+
+    # dimension of node embeddings
+    node_feature_dim = size(edge_features, 1)
+   
+    # stack node embeddings and demands
+    #println("node_embeddings : ", [typeof(model.node_embeddings(1:nnodes))])
+    #println("zeros : ", [typeof(0*zeros(node_feature_dim, ndemands))])
+    full_node_embeddings = hcat(model.node_embeddings(1:nnodes), 0*zeros(Float32,node_feature_dim, ndemands) |> device)
+    #println("full_node_embeddings: ", [typeof(full_node_embeddings), size(full_node_embeddings)])
+
+
+    # apply the graph convolution
+    s,t = edge_index(g)
+    ng = GNNGraph(s, t, ndata=(;x=full_node_embeddings), edata=(;e=edge_features))
+    #encoded_g = model.graph_conv(ng)
+    encoded_nodes,_encoded_edges = model.graph_conv[1](ng, full_node_embeddings, edge_features)
+    if length(model.graph_conv)>1
+        for gnnlayer in model.graph_conv[2:end]
+            encoded_nodes, _encoded_edges = gnnlayer(g, encoded_nodes, _encoded_edges)
+        end
+    end
+
+    # encode get the encoded edges
+    encoded_edges = apply_edges(concat_nodes, g, encoded_nodes, encoded_nodes)
+    #encoded_edges = apply_edges(concat_nodes, g, encoded_g.x, encoded_g.x)
+   
+    # separate the encoded demands
+    demand_idx = repeat(findall(==(0), g.ndata.mask), inner=nedges)
+    encoded_demands = getobs(encoded_nodes, demand_idx)
+    #encoded_demands = getobs(ng.x, demand_idx)
+
+    # separate the encoded real edges
+    real_edge_idx = repeat(findall(==(1), g.edata.mask), ndemands)
+    encoded_real_edges = getobs(encoded_edges, real_edge_idx)
+
+    # score the edges 
+    scores = model.scoring(encoded_real_edges, encoded_demands)
+
+    return scores
+
+end
+
+
+accuracy(y_pred, y_true)     = sum(y_pred .== y_true)/size(y_pred, 1)
+tpcount(y_pred, y_true)      = sum( Bool.(y_pred .== y_true) .& Bool.(y_true)  )
+precision(y_pred, y_true)    = sum(y_pred)>0 ? tpcount(y_pred, y_true)/sum(y_pred) : 0
+recall(y_pred, y_true)       = sum(y_true)>0 ? tpcount(y_pred, y_true)/sum(y_true) : 0
+f_beta_score(y_pred, y_true, beta=1.) = precision(y_pred,y_true)>0. && recall(y_pred,y_true)>0. ? sum(1 .+ (beta^2)) * (precision(y_pred,y_true)*recall(y_pred,y_true))/(((beta^2) * precision(y_pred,y_true)) + recall(y_pred,y_true)) : 0
+graph_reduction(y_pred)      = 1. - sum(y_pred)/prod(size(y_pred))
+
+
+function train_model(epochs, nhidden, 
+		      nlayers, 
+		      device, 
+		      lr, 
+		      dataset_path, 
+		      model_name, 
+		      tb_log_dir,
+		      eval_dataset,
+		      es_patience,
+		      weight,
+		      )
+    dataset_name = basename(dataset_path)
+    eval_dataset_name = basename(eval_dataset)
+
+    println("\tnhidden            = ", nhidden)
+    println("\tnlayers            = ", nlayers)
+    println("\tdevice             = ", device)
+    println("\tlr                 = ", lr)
+    println("\tdataset            = ", dataset_path)
+    println("\tdataset name       = ", dataset_name)
+    println("\tmodel name         = ", model_name)
+    println("\tlog dir            = ", tb_log_dir)
+    println("\tevaluation dataset = ", eval_dataset)
+    println("\tevaluation dataset name = ", eval_dataset_name)
+    println("\tES patience        = ", es_patience)
+    println("\tweight             = ", weight)
+    save_path = joinpath("models", dataset_name, model_name*".bson")
+    mkpath(dirname(save_path))
+    println("\tmodel save path    = ", save_path)
+
+
+    best_f1 = -1.0f8
+    
+    all_graphs = GNNGraph[]
+    all_graphs = UMFSolver.load_dataset(dataset_path)
+
+
+    # count number of nodes in the graph
+    nnodes = sum(all_graphs[1].ndata.mask)
+    println("\tnnodes             = ", nnodes)
+
+    model = ClassifierModel(nhidden, 3, nlayers, nnodes) |> device
+    
+    ps = Flux.params(model)
+    
+    opt = Flux.Optimise.Optimiser(ClipNorm(1.0f-4), Adam(lr))
+    #opt = Adam(lr)
+
+    
+    train_graphs, test_graphs = MLUtils.splitobs(all_graphs, at=0.9)
+    
+    train_loader = DataLoader(train_graphs,
+                    batchsize=1, shuffle=true, collate=true)
+    test_loader = DataLoader(test_graphs,
+                    batchsize=1, shuffle=false, collate=true)
+    
+    
+    function metrics(loader)
+        preds = [(Int64.(cpu((vec(model(g |> device)) .> 0))),Int64.(cpu(vec(g.targets)))) for g in loader]
+        acc = mean([accuracy(pred, lab) for (pred,lab) in preds])
+        rec = mean([recall(pred, lab) for (pred,lab) in preds])
+        prec = mean([precision(pred, lab) for (pred,lab) in preds])
+        f1 = mean([f_beta_score(pred, lab) for (pred,lab) in preds])
+        gr = mean([graph_reduction(pred) for (pred,lab) in preds])
+    
+        return (acc=acc, rec=rec, prec=prec, f1=f1, gr=gr)
+    end
+    
+    
+    logger = TBLogger(tb_log_dir, tb_overwrite)
+    
+    
+    function TBCallback(epoch)
+        train_loss = loss(train_loader)
+        test_loss = loss(test_loader)
+        train_metrics = metrics(train_loader)
+        test_metrics = metrics(test_loader)
+
+        #println("train_loss: ", train_loss)
+        #println("test loss : ", test_loss)
+        #println("train_metrics: ", train_metrics)
+        #println("test metrics : ", test_metrics)
+
+        with_logger(logger) do
+            @info "train" loss=train_loss train_metrics...
+            @info "test" loss=test_loss test_metrics...
+            #@info "train" loss=loss(train_loader) metrics(train_loader)...
+            #@info "test"  loss=loss(test_loader) metrics(test_loader)...
+        end
+    
+    end
+    
+    
+    #loss(g::GNNGraph) = logitbinarycrossentropy(vec(model(g)), vec(g.y))
+    loss(g::GNNGraph) = Flux.Losses.tversky_loss(sigmoid(vec(model(g))), vec(g.targets); beta=0.2)
+
+    
+    #function loss(g::GNNGraph)
+    #    y_true = vec(g.y)
+    #    y_pred = vec(model(g))
+    #    ow = weight |> device #1. - (sum(y_true) / size(y_true,1)) |> device
+    #    weights = (y_true .* ow) .+ ((1 .- y_true) .* (1 .- ow))# |> device
+    #    return mean(@.(weights * (1 - y_true) * y_pred - logσ(y_pred)))
+    #end
+
+    loss(loader) = mean(loss(g |> device) for g in loader)
+    
+    # Early stopping
+    function es_metric()
+        return loss(test_loader)
+        return -metrics(test_loader).f1
+    end
+    es = Flux.early_stopping(es_metric, es_patience, min_dist=1.0f-8, init_score=1.0f8);
+    
+    
+    println("starting training")
+    for epoch in 1:epochs
+        for g in train_loader
+            #println("labels shape type, ", typeof(g.y), ", ", size(g.y))
+            g = g |> device
+            grad = gradient(() -> loss(g), ps)
+            Flux.Optimise.update!(opt, ps, grad)
+            #grad = gradient(() -> loss(g), ps)
+	    #println("Grad: ", grad)
+	    #println(Flux.destructure(grad))
+	    #println([grad[p] for p in ps])
+        end
+
+        test_metrics = metrics(test_loader)
+        @info (; epoch, train_loss=loss(train_loader), test_loss=loss(test_loader), test_metrics=test_metrics)
+        TBCallback(epoch)
+        # checkpoints
+        if test_metrics.f1 > best_f1
+            best_f1 = test_metrics.f1
+    	    #model_state = Flux.state(cpu(model))
+    	    #jldsave(save_path, model_state)
+	    _model = model |> Flux.cpu
+
+    	    @save save_path _model
+	    #model_state = Flux.state(Flux.cpu(model))
+	    #println("model state type : ", typeof(model_state))
+	    #jldsave(replace(save_path, ".bson"=>".jld2"), model_state=Flux.state(model))
+        end			   
+        # early stopping
+        es() && break
+    end
+    
+    # testing: load the testing dataset
+    function solve_dataset(dataset_dir::String, output_dir::String, pr::String)
+        for f in readdir(dataset_dir, join=true)
+            link_f = joinpath(f, "link.csv")
+            if !isfile(link_f)
+                continue
+            end
+            sol, stats = solveUMF(f*"/", "CG", "highs", "./output.txt", "", pr)
+            stats_path = joinpath(output_dir, basename(f))
+	    
+            UMFSolver.save(stats, stats_path)
+            #inst = UMFData(f)
+        end
+    end
+    
+    
+    println("Starting evaluation")
+    
+    mkpath("outputs/$(eval_dataset_name)/$(model_name)/default")
+    solve_dataset(eval_dataset, "outputs/$(eval_dataset_name)/$(model_name)/default", "dijkstra")
+    mkpath("outputs/$(eval_dataset_name)/$(model_name)/kspfilter1")
+    solve_dataset(eval_dataset, "outputs/$(eval_dataset_name)/$(model_name)/kspfilter1", "kspfilter 1")
+    mkpath("outputs/$(eval_dataset_name)/$(model_name)/kspfilter2")
+    solve_dataset(eval_dataset, "outputs/$(eval_dataset_name)/$(model_name)/kspfilter2", "kspfilter 2")
+    mkpath("outputs/$(eval_dataset_name)/$(model_name)/clssp1")
+    solve_dataset(eval_dataset, "outputs/$(eval_dataset_name)/$(model_name)/clssp1", "clssp $(save_path) 1")
+    # move the reduction file
+    mv(basename(save_path)*"_reduction.csv", "outputs/$(eval_dataset_name)/$(model_name)/clssp1_reduction.csv", force=true)
+end 
+
+
+#function train_model(nhidden, 
+#		      nlayers, 
+#		      device, 
+#		      lr, 
+#		      dataset_name, 
+#		      model_name, 
+#		      tb_log_dir,
+#                     eval_dataset,
+#		      es_patience,
+#                     weight,
+
+epochs_ = [100]
+nhiddens = [8]
+nlayers_ = [2]
+devices = [device]
+lrs = [1.0f-4]
+train_datasets = ["./datasets/dataset_prc_small_flexE_1_train"]
+eval_datasets = ["./datasets/dataset_prc_small_flexE_1_test"]
+weights = [.95]
+es_patiences = [100]
+
+
+# call train_model on a dummy case first to force compilation
+train_model(1, 1, 1, device, 0.0001, eval_datasets[1], "dummy2_model", "dummy2_model_log", eval_datasets[1], 1, .5)
+#rm("dummy2_model.bson", force=true)
+#rm("dummy2_model_log", recursive=true)
+
+for tprms in Iterators.product(epochs_,
+				nhiddens, 
+				nlayers_, 
+				devices, 
+				lrs, 
+				train_datasets, 
+				eval_datasets, 
+				es_patiences, 
+				weights)
+    model_name = "model2_l"*string(tprms[3])*"_lr"*string(tprms[5])*"_h"*string(tprms[2])*"_tversky.2"
+    #model_name = "model2_l"*string(tprms[3])*"_lr"*string(tprms[5])*"_h"*string(tprms[2])*"_focal"
+
+    tb_log_dir = joinpath("tb_logs", "model2_"*basename(tprms[6])*"_logs", model_name)
+    train_model(tprms[1],tprms[2], 
+		 tprms[3], 
+		 tprms[4], 
+		 tprms[5], 
+		 tprms[6], 
+		 model_name, 
+		 tb_log_dir, 
+		 tprms[7], 
+		 tprms[8], 
+		 tprms[9])
+end

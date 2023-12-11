@@ -1,0 +1,144 @@
+ENV["JULIA_CUDA_MEMORY_POOL"] = "none"
+
+
+using GraphNeuralNetworks, Graphs, Flux, CUDA, Statistics, MLUtils
+using Flux: DataLoader
+using Flux.Losses: logitbinarycrossentropy, binary_focal_loss, mean, logsoftmax
+
+using UMFSolver
+using Distributions
+using TensorBoardLogger
+using Logging
+using LinearAlgebra
+
+using BSON: @save
+
+device = CUDA.functional() ? Flux.gpu : Flux.cpu;
+
+
+# graph opposite layer
+struct EdgeReverseLayer <: GraphNeuralNetworks.GNNLayer
+end
+
+function (l::EdgeReverseLayer)(g::GNNGraph)
+    return g
+    s, t = edge_index(g)
+    return GNNGraph(t, s, ndata=(;x=g.ndata.x), edata=(;e=g.edata.e))
+end
+
+# message passing layer
+struct MPLayer
+    forward_conv
+    #drop1
+    bn_n
+    bn_e
+    rev
+    backward_conv
+    #drop2
+end
+
+Flux.@functor MPLayer
+
+function MPLayer(n::Int)
+    return MPLayer(MEGNetConv(n=>n), Flux.BatchNorm(n), Flux.BatchNorm(n), EdgeReverseLayer(), MEGNetConv(n=>n))
+end
+
+function (l::MPLayer)(g, x, e)
+    x,e = l.forward_conv(g, x, e)
+    #x = l.drop1(x)
+    x = l.bn_n(x)
+    e = l.bn_e(e)
+    ng = l.rev(g)
+    x,e = l.backward_conv(ng, x, e)
+    return x, e
+end
+
+# classifier
+struct ClassifierModel
+    node_embeddings
+    edge_encoder
+    graph_conv
+    scoring
+end
+
+Flux.@functor ClassifierModel
+
+function concat_nodes(xi, xj, e::Nothing)
+    return vcat(xi, xj)
+end
+
+function ClassifierModel(node_feature_dim::Int, edge_feature_dim::Int, n_layers::Int, nnodes::Int)
+    node_embeddings = Flux.Embedding(nnodes, node_feature_dim)
+    edge_encoder    = Chain(
+			    Flux.Dense(edge_feature_dim => node_feature_dim, elu),
+			    Flux.Dropout(.1),
+			    Flux.BatchNorm(node_feature_dim),
+			    Flux.Dense(node_feature_dim=>node_feature_dim, elu),
+			    Flux.Dropout(.1)
+			    )
+    edge_encoder = Dense(edge_feature_dim => node_feature_dim, elu)
+    #graph_conv      = [MEGNetConv(node_feature_dim => node_feature_dim) for _ in 1:n_layers]
+    graph_conv      = [MPLayer(node_feature_dim) for _ in 1:n_layers]
+
+    scoring = Flux.Bilinear((2*node_feature_dim, node_feature_dim) => 1, elu)
+
+    ClassifierModel(node_embeddings, edge_encoder, graph_conv, scoring)
+end
+
+function (model::ClassifierModel)(g::GNNGraph)
+    # number of real edges
+    nedges = sum(g.edata.mask)
+    # stack the node embeddings and demand embeddings
+    nnodes = sum(g.ndata.mask)
+    ndemands = g.num_nodes - nnodes
+
+
+    # first encode the edge features
+    edge_features = model.edge_encoder(g.e)
+    #println("edge_features : ", [typeof(edge_features), size(edge_features)])
+
+    # dimension of node embeddings
+    node_feature_dim = size(edge_features, 1)
+   
+    # stack node embeddings and demands
+    #println("node_embeddings : ", [typeof(model.node_embeddings(1:nnodes))])
+    #println("zeros : ", [typeof(0*zeros(node_feature_dim, ndemands))])
+    tmp = hcat(model.node_embeddings(1:nnodes), 0*zeros(Float32,node_feature_dim, ndemands))
+
+    #println("\tfne : ", [typeof(tmp), size(tmp)])
+    full_node_embeddings = hcat(model.node_embeddings(1:nnodes), 0*zeros(Float32,node_feature_dim, ndemands) |> device)
+    #full_node_embeddings = hcat(model.node_embeddings(1:nnodes), 0*zeros(Float32,node_feature_dim, ndemands))
+
+    #println("full_node_embeddings: ", [typeof(full_node_embeddings), size(full_node_embeddings)])
+
+
+    # apply the graph convolution
+    s,t = edge_index(g)
+    ng = GNNGraph(s, t, ndata=(;x=full_node_embeddings), edata=(;e=edge_features))
+    #encoded_g = model.graph_conv(ng)
+    encoded_nodes,_encoded_edges = model.graph_conv[1](ng, full_node_embeddings, edge_features)
+    if length(model.graph_conv)>1
+        for gnnlayer in model.graph_conv[2:end]
+            encoded_nodes, _encoded_edges = gnnlayer(g, encoded_nodes, _encoded_edges)
+        end
+    end
+
+    # encode get the encoded edges
+    encoded_edges = apply_edges(concat_nodes, g, encoded_nodes, encoded_nodes)
+    #encoded_edges = apply_edges(concat_nodes, g, encoded_g.x, encoded_g.x)
+   
+    # separate the encoded demands
+    demand_idx = repeat(findall(==(0), g.ndata.mask), inner=nedges)
+    encoded_demands = getobs(encoded_nodes, demand_idx)
+    #encoded_demands = getobs(ng.x, demand_idx)
+
+    # separate the encoded real edges
+    real_edge_idx = repeat(findall(==(1), g.edata.mask), ndemands)
+    encoded_real_edges = getobs(encoded_edges, real_edge_idx)
+
+    # score the edges 
+    scores = model.scoring(encoded_real_edges, encoded_demands)
+
+    return scores
+
+end

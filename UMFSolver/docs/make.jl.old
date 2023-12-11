@@ -1,0 +1,19 @@
+push!(LOAD_PATH, "../src/")
+
+using Documenter, UMFSolver
+
+makedocs(;
+    sitename = "UMF Solver Documentation",
+    modules = [UMFSolver],
+    format = Documenter.HTML(;
+        prettyurls = get(ENV, "CI", "false") == "true",
+        assets = String[],
+    ),
+    pages = [
+        "Home" => "index.md",
+        "Usage" => "readsolve.md",
+        "Compact" => "compact.md",
+        "Column Generation" => "colgen.md",
+        "API reference" => "api.md",
+    ],
+)

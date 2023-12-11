@@ -1,0 +1,180 @@
+using Flux
+using GraphNeuralNetworks
+
+"""
+    ArcDemandClassifierModel
+
+Trainable Flux model that takes as input a GNNGraph object and outputs a 0-1-prediction with the 
+shape (|A|, |K|).
+"""
+struct ArcDemandClassifierModel
+    node_embeddings
+    first_conv
+    last_conv
+    layers
+    #dense
+    demand_encoder
+    scoring
+end
+
+Flux.@functor ArcDemandClassifierModel                              # step 2
+
+function ArcDemandClassifierModel(node_embedding_dim::Int, edge_feature_dim::Int, hidden_dim::Int, out_d::Int, n_layers::Int, n_nodes::Int) # step 3  
+    node_embeddings = randn(node_embedding_dim, n_nodes)
+    first_conv = CGConv((node_embedding_dim, edge_feature_dim) => hidden_dim, relu)
+    last_conv = GraphConv(hidden_dim => out_d)
+    layers = [GraphConv(hidden_dim => hidden_dim) for i in 1:n_layers]
+    #layers = GNNChain([GraphConv(hidden_dim => hidden_dim) for i in 1:n_layers]...)
+
+    demand_encoder = Dense(out_d, 2*out_d)
+    scoring = Flux.Bilinear((2*node_embedding_dim, 2*out_d) => 1)
+    ArcDemandClassifierModel(node_embeddings, first_conv, last_conv, layers, demand_encoder, scoring)
+end
+
+#function hoho(ec::Matrix{Float32}, demand_codes::Matrix{Float32})
+#    return [dot(ec, demand_codes[:,i]) for i = 1:size(demand_codes,2)]
+#    return [dot(ec,dc) for dc in demand_codes]
+#end
+
+
+function hoho(ec, demand_codes)
+    return [dot(ec, demand_codes[:,i]) for i = 1:size(demand_codes,2)]
+    return [dot(ec,dc) for dc in demand_codes]
+end
+
+function haha(xi::Matrix{Float32}, xj::Matrix{Float32}, e::Nothing)
+    return vcat(xi, xj)
+end
+function haha(xi, xj, e)
+    return vcat(xi, xj)
+end
+
+
+function hehe(edge_code, edge_graph_idx , demand_codes, demand_graph_indicators)
+    println("in hehe")
+    return [(edge_graph_idx==view(demand_graph_indicators,i)) ? dot(edge_code, view(demand_codes,i)) : 0 for i = 1:size(demand_codes,2)]
+
+    return [(edge_graph_idx==demand_graph_indicators[i]) ? dot(edge_code, demand_codes[:,i]) : 0 for i = 1:size(demand_codes,2)]
+end
+
+using CUDA, MLUtils
+function (model::ArcDemandClassifierModel)(g::GNNGraph)     # step 4
+    #CUDA.allowscalar(true)
+
+    # if graph has more nodes then the node_embeddings size
+    node_embeddings = model.node_embeddings
+    println("Node embeddings type : ", typeof(node_embeddings), ", ", size(node_embeddings))
+    #node_embeddings = repeat(model.node_embeddings, 1, g.num_graphs)
+    println("g.num_graphs: ", typeof(g.num_graphs), ", ", g.num_graphs)
+    println("num nodes , ", size(node_embeddings), ", ", size(node_embeddings,2))
+    node_embedding_idx = repeat(1:size(node_embeddings, 2), g.num_graphs)
+    println("Node embeddings_idx type and size: ", typeof(node_embedding_idx), ", ", size(node_embedding_idx))
+    node_embedding_view = obsview(model.node_embeddings, node_embedding_idx)
+    println("Node embeddings_view type and size: ", typeof(node_embedding_view), ", ", size(node_embedding_view))
+
+    println("Node embeddings type : ", typeof(node_embeddings), ", ", size(node_embeddings))
+
+    # integrates the node and edge features
+    #x = relu(model.first_conv(g, node_embeddings, g.edata.e))
+    x = relu(model.first_conv(g, node_embedding_view, g.edata.e))
+
+    println("x type : ", typeof(x))
+
+    for l in model.layers
+        x = relu(l(g, x))
+        println("x 2 type : ", typeof(x))
+    end
+    
+    x = relu(model.last_conv(g, x))
+    println("x last type : ", typeof(x), ", ", size(x))
+
+    # arc encoding
+    t = apply_edges(haha, g, x, x)
+    println("t type : ", typeof(t))
+
+    
+    # apply dense layer
+    NE = size(x,2)
+    
+    n_edges = size(g.edata.mask,1) - sum(g.edata.mask)
+
+    #println("type of 't': ", typeof(t))
+    
+    # edge codes
+    #println("g.edata.mask size, type : ", size(g.edata.mask), ", ", typeof(g.edata.mask))
+    #println("t size, type : ", size(t), ", ", typeof(t))
+    #println("syyym ", sum(g.edata.mask))
+
+    idx = findall(==(0), g.edata.mask)
+    println("idx type : ", typeof(idx))
+
+    #println("idx type and size: ", typeof(idx), ", ", size(idx))
+    #println(idx)
+
+    #edge_codes = getobs(t, idx)
+    edge_codes = obsview(t, idx)
+
+    println("edge_codes type : ", typeof(edge_codes))
+    #println("type of 'edge_codes': ", typeof(edge_codes), ", ", size(edge_codes))
+    #edge_graph_indicator = graph_indicator(g, edges=true)[idx]
+    #edge_graph_indicator = getobs(graph_indicator(g, edges=true), idx)
+
+    #println("type of 'edge_graph_indicator': ", typeof(edge_graph_indicator))
+    # demand codes
+    #demand_codes = model.demand_encoder(x[:,g.ndata.mask])
+    #aa = x[:,g.ndata.mask]
+    #bb = getobs(x, g.ndata.mask)
+    #println("aa type size: ", typeof(aa), ", ", size(aa))
+    #println("bb type size: ", typeof(bb), ", ", size(bb))
+    #demand_codes = model.demand_encoder(getobs(x, g.ndata.mask))
+
+    demand_code_idx = findall(==(1), g.ndata.mask)
+    println("demand_code_idx type and size: ", typeof(demand_code_idx), ", ", size(demand_code_idx))
+    demand_code_view = getobs(x, demand_code_idx)
+    #demand_code_view = obsview(x, demand_code_idx)
+
+    demand_codes = model.demand_encoder(demand_code_view)
+    #demand_codes = model.demand_encoder(view(x, demand_code_idx))
+    println("demand_codes type: ", typeof(demand_codes), ", ", size(demand_codes))
+
+    #println("type of 'demand_codes': ", typeof(demand_codes))
+    #demand_graph_indicator = graph_indicator(g)[g.ndata.mask]
+    #println("type of 'demand_graph_indicator': ", typeof(demand_graph_indicator))
+    
+    # scoring: bilinear product between each edge and demand codes
+    #println("demand_codes size : ", size(demand_codes))
+    n_demands = size(demand_codes, 2)
+    #println("Number of demands: ", n_demands)
+    #println("edge_codes size : ", size(edge_codes))
+    #stacked_edge_codes = repeat(edge_codes, 1, n_demands)
+    #println("type of 'stacked_edge_codes': ", typeof(stacked_edge_codes), ", ", size(stacked_edge_codes))
+
+    stacked_edge_idx = repeat(1:size(edge_codes,2), n_demands) |> gpu
+    println("stacked_edge_idx type and size: ", typeof(stacked_edge_idx), ", ", size(stacked_edge_idx))
+    stacked_edge_code_view = obsview(edge_codes, stacked_edge_idx)
+    #stacked_edge_code_view = getobs(edge_codes, stacked_edge_idx)
+    #stacked_edge_code_view = view(edge_codes,stacked_edge_idx)
+
+    println("stacked_edge_code_view type and size: ", typeof(stacked_edge_code_view), ", ", size(stacked_edge_code_view))
+
+
+
+    #println("Number of edges: ", n_edges)
+    #repeated_demand_codes = repeat(demand_codes, inner=(1, n_edges))
+    #println("repeated_demand_codes type and size : ", typeof(repeated_demand_codes), ", ", size(repeated_demand_codes)) 
+    
+    repeated_demand_idx = repeat(1:size(demand_codes,2), inner=n_edges) |> gpu
+    println("repeated_demand_idx type and size: ", typeof(repeated_demand_idx), ", ", size(repeated_demand_idx))
+    repeated_demand_code_view = obsview(demand_codes, repeated_demand_idx)
+    #repeated_demand_code_view = getobs(demand_codes, repeated_demand_idx)
+
+    println("repeated_demand_code_view type and size: ", typeof(repeated_demand_code_view), ", ", size(repeated_demand_code_view))
+
+    #scores = model.scoring(stacked_edge_codes, repeated_demand_codes)
+    #println("scores type and size: ", typeof(scores), ", ", size(scores))
+
+    scores = model.scoring(stacked_edge_code_view, repeated_demand_code_view)
+    println("scores type and size: ", typeof(scores), ", ", size(scores))
+
+    return scores
+end
